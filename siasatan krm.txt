@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HACCPKRMFIELDPRO - Integrasi Penuh</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.25/jspdf.plugin.autotable.min.js"></script>
+    
+    <!-- Firebase SDKs & Cloud Logic -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDocs, collection, query, deleteDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global configuration from environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'haccpkrm-field-pro';
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        let currentUser = null;
+
+        // Rule 3: Auth Before Queries
+        async function initAuth() {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) { console.error("Ralat pengesahan:", err); }
+        }
+
+        onAuthStateChanged(auth, (user) => {
+            currentUser = user;
+            if (user) console.log("HACCP Cloud Connected:", user.uid);
+        });
+
+        initAuth();
+
+        // Database Functions
+        window.saveToCloud = async function() {
+            if (!currentUser) { showToast("Menyambung ke pelayan...", "error"); return; }
+            const data = getFullData();
+            const docId = data.basic.namaPremis ? data.basic.namaPremis.replace(/\s+/g, '-').toLowerCase() + '-' + Date.now() : 'draft-' + Date.now();
+            try {
+                // Rule 1: Strict Paths
+                const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'investigations', docId);
+                await setDoc(docRef, data);
+                showToast("Siasatan berjaya disimpan ke awan!", "success");
+            } catch (error) { showToast("Gagal menyimpan draf.", "error"); }
+        };
+
+        window.loadDrafts = async function() {
+            if (!currentUser) return;
+            const container = document.getElementById('draftsList');
+            container.innerHTML = '<p class="text-center p-4 text-xs text-emerald-600 font-bold">Memuatkan data dari awan...</p>';
+            try {
+                const colRef = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'investigations');
+                const querySnapshot = await getDocs(colRef);
+                container.innerHTML = '';
+                if (querySnapshot.empty) { container.innerHTML = '<p class="text-center p-4 text-gray-500 text-xs">Tiada draf dijumpai.</p>'; return; }
+                const docs = [];
+                querySnapshot.forEach(d => docs.push({id: d.id, ...d.data()}));
+                // Rule 2: Sort in memory
+                docs.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+                docs.forEach((data) => {
+                    const div = document.createElement('div');
+                    div.className = "p-3 border-b hover:bg-gray-50 flex justify-between items-center";
+                    div.innerHTML = `
+                        <div class="flex-1 mr-2">
+                            <p class="font-bold text-sm text-emerald-800 truncate">${data.basic.namaPremis || 'Tanpa Nama'}</p>
+                            <p class="text-[9px] text-gray-400">${new Date(data.updatedAt).toLocaleString()}</p>
+                        </div>
+                        <div class="flex gap-1">
+                            <button type="button" onclick="applyDraft('${data.id}')" class="bg-emerald-600 text-white px-2 py-1 rounded text-[10px] font-bold uppercase shadow-sm">Buka</button>
+                            <button type="button" onclick="deleteDraft('${data.id}')" class="bg-red-50 text-red-600 px-2 py-1 rounded text-[10px] font-bold uppercase border border-red-200">Padam</button>
+                        </div>
+                    `;
+                    container.appendChild(div);
+                });
+            } catch (error) { showToast("Ralat memuatkan senarai.", "error"); }
+        };
+
+        window.applyDraft = async function(id) {
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'investigations', id);
+                const snap = await getDoc(docRef);
+                if (snap.exists()) {
+                    const data = snap.data();
+                    // Clear current dynamic containers
+                    document.getElementById('handlersContainer').innerHTML = '';
+                    document.getElementById('rawMaterialsContainer').innerHTML = '';
+                    document.getElementById('processContainer').innerHTML = '';
+                    
+                    const form = document.getElementById('haccpForm');
+                    // Populate basic form fields
+                    for (const key in data.basic) {
+                        const input = form.elements[key];
+                        if (input) {
+                            if (input.type === 'checkbox') input.checked = data.basic[key];
+                            else input.value = data.basic[key];
+                        }
+                    }
+                    // Restore dynamic rows
+                    if(data.handlers) data.handlers.forEach(h => addHandlerRow(h.nama, h.jawatan, h.typhoidDate));
+                    if(data.rawMaterials) data.rawMaterials.forEach(r => addRawMaterialRow(r.name, r.q1, r.q2, r.q3, r.sumber, r.simpanan, r.keadaan, r.tarikhBeli));
+                    if(data.processes) data.processes.forEach(p => addProcessRow(p.step, p.findings, p.q1, p.q2, p.q3, p.q4, p.ulasan));
+                    
+                    window.generalImages = data.images || [];
+                    renderImagePreview();
+                    closeModal('loadModal');
+                    showToast("Draf berjaya dimuatkan!", "success");
+                    updateAgenOptions();
+                }
+            } catch (err) { showToast("Gagal muat draf.", "error"); }
+        };
+
+        window.deleteDraft = async function(id) {
+            if(confirm("Padam draf ini secara kekal?")) {
+                try {
+                    await deleteDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'investigations', id));
+                    loadDrafts();
+                } catch (err) { showToast("Ralat memadam draf.", "error"); }
+            }
+        };
+    </script>
+
+    <style>
+        .step-content { display: none; }
+        .step-content.active { display: block; }
+        .form-input { width: 100%; padding: 0.65rem; border: 1px solid #d1d5db; border-radius: 0.5rem; margin-top: 0.2rem; outline: none; font-size: 0.9rem; transition: border-color 0.2s; }
+        .form-input:focus { border-color: #059669; box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2); }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fadeIn { animation: fadeIn 0.3s ease-out; }
+        .card-dynamic { background: white; padding: 1rem; border-radius: 1rem; border: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1rem; position: relative; }
+        .q-label { font-size: 10px; color: #6b7280; font-weight: 600; text-transform: uppercase; margin-top: 4px; display: block; }
+        .badge-status { padding: 4px 10px; border-radius: 99px; font-size: 10px; font-weight: 800; transition: all 0.3s ease; }
+        .status-ya { background: #dc2626; color: #ffffff; }
+        .status-tidak { background: #dcfce7; color: #166534; }
+        .toast { position: fixed; bottom: 85px; left: 50%; transform: translateX(-50%); padding: 12px 24px; border-radius: 12px; color: white; z-index: 1000; font-weight: bold; display: none; }
+        .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 900; align-items: center; justify-content: center; }
+        .q-row { display: flex; justify-content: space-between; align-items: center; font-size: 9px; background: #f9fafb; padding: 6px 8px; border-radius: 6px; margin-bottom: 3px; line-height: 1.3; }
+        .q-text { flex: 1; padding-right: 12px; font-weight: 500; color: #374151; }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen pb-28 font-sans">
+
+    <div id="toast" class="toast shadow-2xl"></div>
+
+    <div id="loadModal" class="modal">
+        <div class="bg-white w-[90%] max-w-sm rounded-2xl shadow-2xl overflow-hidden animate-fadeIn">
+            <div class="bg-emerald-800 p-4 text-white flex justify-between items-center">
+                <h3 class="font-bold">Senarai Simpanan</h3>
+                <button onclick="closeModal('loadModal')" class="text-2xl">&times;</button>
+            </div>
+            <div id="draftsList" class="max-h-[60vh] overflow-y-auto"></div>
+            <div class="p-4 bg-gray-50 text-right">
+                <button onclick="closeModal('loadModal')" class="text-xs font-bold text-gray-500 uppercase">Tutup</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header class="bg-emerald-900 text-white p-4 sticky top-0 z-50 shadow-lg">
+        <div class="max-w-xl mx-auto flex justify-between items-center">
+            <div class="flex items-center gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" width="22" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                <h1 class="font-bold text-md tracking-tight uppercase">HACCPKRMFIELDPRO</h1>
+            </div>
+            <div class="flex gap-2">
+                <button type="button" onclick="openLoadModal()" class="text-[10px] bg-blue-600 px-3 py-1 rounded-full font-bold uppercase text-white shadow active:scale-95 transition-transform">Buka</button>
+                <button type="button" onclick="saveToCloud()" class="text-[10px] bg-orange-600 px-3 py-1 rounded-full font-bold uppercase text-white shadow active:scale-95 transition-transform">Simpan</button>
+                <button type="button" onclick="confirmReset()" class="text-[10px] bg-red-600 px-2 py-1 rounded-full font-bold uppercase text-white shadow">Reset</button>
+            </div>
+        </div>
+        <div id="stepIndicator" class="max-w-xl mx-auto mt-2 text-[10px] text-emerald-200 font-bold uppercase tracking-widest text-center">Langkah 1/10</div>
+    </header>
+
+    <main class="max-w-xl mx-auto p-4">
+        <form id="haccpForm">
+            
+            <!-- STEP 1: MAKLUMAT ASAS -->
+            <div id="step1" class="step-content active animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2 flex items-center gap-2">
+                    Bahagian A: Maklumat Kejadian
+                </h2>
+                <div class="space-y-4">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div><label class="q-label">Negeri</label><input type="text" name="negeri" id="inputNegeri" class="form-input" placeholder="cth: Perak"></div>
+                        <div><label class="q-label">Daerah</label><input type="text" name="daerah" id="inputDaerah" class="form-input" placeholder="cth: Kinta"></div>
+                    </div>
+                    <div>
+                        <label class="q-label">Kategori Premis</label>
+                        <select name="kategoriPremis" class="form-input">
+                            <option value="">-- Pilih Kategori --</option>
+                            <option>Sekolah (KPM)</option><option>Sekolah (Bukan KPM)</option><option>Institusi di bawah KKM</option><option>MRSM</option><option>PLKN</option><option>Pra-Sekolah</option><option>Taska / Tabika</option><option>Lain-lain</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="q-label">Jenis Premis</label>
+                        <select name="jenisPremis" class="form-input">
+                            <option value="">-- Pilih Jenis --</option>
+                            <option>Kantin Sekolah</option><option>Katerer</option><option>Katerer RMT</option><option>Dapur Asrama</option><option>Kenduri</option><option>Gerai Makan</option>
+                        </select>
+                    </div>
+                    <div><label class="q-label">Nama & Alamat Premis Tempat Berlaku</label><input type="text" name="namaPremis" id="inputNamaPremis" class="form-input"></div>
+                    
+                    <!-- PERUBAHAN TAHAP KEBERSIHAN KEPADA INPUT TEXT -->
+                    <div class="grid grid-cols-2 gap-3 bg-emerald-50 p-3 rounded-lg border border-emerald-100">
+                        <div>
+                            <label class="q-label text-emerald-800 font-bold uppercase">Kebersihan Sebelum Kejadian</label>
+                            <input type="text" name="kebersihanSebelum" class="form-input border-emerald-200" placeholder="cth: Gred A (86%)">
+                        </div>
+                        <div>
+                            <label class="q-label text-emerald-800 font-bold uppercase">Kebersihan Semasa Kejadian</label>
+                            <input type="text" name="kebersihanSemasa" class="form-input border-emerald-200" placeholder="cth: Gred C (60%)">
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-3">
+                        <div><label class="q-label">Tarikh Kejadian</label><input type="date" name="tarikhKejadian" class="form-input"></div>
+                        <div><label class="q-label">Tarikh Siasatan</label><input type="date" name="tarikhSiasatan" class="form-input"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- STEP 2: MAKLUMAT KONTRAKTOR -->
+            <div id="step2" class="step-content animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2">Maklumat Kontraktor / Pembekal</h2>
+                <div class="space-y-4">
+                    <div><label class="q-label">Nama Syarikat Kontraktor</label><input type="text" name="namaKontraktor" class="form-input"></div>
+                    <div><label class="q-label">No SSM</label><input type="text" name="ssmKontraktor" class="form-input"></div>
+                    <div><label class="q-label">Alamat Premis / Pejabat</label><textarea name="alamatKontraktor" rows="2" class="form-input"></textarea></div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div><label class="q-label">Pengurus / Penyelia</label><input type="text" name="pengurusKontraktor" class="form-input"></div>
+                        <div><label class="q-label">No. Telefon</label><input type="text" name="telKontraktor" class="form-input"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- STEP 3: STATISTIK & GEJALA -->
+            <div id="step3" class="step-content animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2">Statistik & Gejala</h2>
+                <div class="space-y-4">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div><label class="q-label">Bil. Kes (Orang)</label><input type="number" name="bilKes" class="form-input" value="0"></div>
+                        <div><label class="q-label">Bil. Terdedah (Orang)</label><input type="number" name="bilTerdedah" class="form-input" value="0"></div>
+                    </div>
+                    <div>
+                        <label class="q-label">Gejala Dominan</label>
+                        <select name="gejala" class="form-input">
+                            <option>Sakit Perut</option><option>Cirit Birit</option><option>Muntah</option><option>Loya</option><option>Demam</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="q-label">Tempoh Inkubasi</label>
+                        <select name="inkubasi" id="inkubasiSelect" class="form-input" onchange="updateAgenOptions()">
+                            <option value="1-6">Sangat Pendek (1-6 jam)</option><option value="7-12">Sederhana (7-12 jam)</option><option value="13-72">Panjang (13-72 jam)</option><option value=">4">Sangat Panjang (>4 hari)</option>
+                        </select>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3 bg-red-50 p-2 rounded border border-red-100">
+                        <div><label class="q-label">Onset Pertama</label><input type="datetime-local" name="onsetPertama" class="form-input"></div>
+                        <div><label class="q-label">Onset Terakhir</label><input type="datetime-local" name="onsetTerakhir" class="form-input"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- STEP 4: AGEN PENYEBAB -->
+            <div id="step4" class="step-content animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2">Bahagian F: Agen Penyebab Disyaki</h2>
+                <div class="space-y-4">
+                    <div><label class="q-label uppercase">Bakteria (Mengikut Inkubasi)</label><select id="agenSelect" name="agen" class="form-input"></select></div>
+                    <div>
+                        <label class="q-label uppercase">Agen Virus / Seafood / Kimia / Fizikal</label>
+                        <input type="text" name="agenLain" class="form-input" placeholder="Nyatakan jenis">
+                    </div>
+                    <div class="bg-amber-50 p-3 rounded-lg border border-amber-100">
+                        <label class="q-label uppercase font-black text-amber-900">Makanan Disyaki Utama</label>
+                        <input type="text" name="makananDisyaki" id="inputMakanan" class="form-input border-amber-200">
+                    </div>
+                </div>
+            </div>
+
+            <!-- STEP 5: PENGENDALI -->
+            <div id="step5" class="step-content animate-fadeIn">
+                <div class="flex justify-between items-center mb-4 border-b-2 border-emerald-100 pb-2">
+                    <h2 class="text-lg font-bold text-emerald-900">Profil Pengendali</h2>
+                    <button type="button" onclick="addHandlerRow()" class="bg-emerald-600 text-white p-2 rounded-full shadow-md">+</button>
+                </div>
+                <div id="handlersContainer" class="space-y-4"></div>
+            </div>
+
+            <!-- STEP 6: BAHAN MENTAH -->
+            <div id="step6" class="step-content animate-fadeIn">
+                <div class="flex justify-between items-center mb-4 border-b-2 border-emerald-100 pb-2">
+                    <h2 class="text-lg font-bold text-emerald-900 text-sm">Bahagian D: Bahan Mentah & Pembungkusan</h2>
+                    <button type="button" onclick="addRawMaterialRow()" class="bg-blue-600 text-white p-2 rounded-full shadow-md">+</button>
+                </div>
+                <div id="rawMaterialsContainer" class="space-y-4"></div>
+            </div>
+
+            <!-- STEP 7: KAWALAN PROSES -->
+            <div id="step7" class="step-content animate-fadeIn">
+                <div class="flex justify-between items-center mb-4 border-b-2 border-emerald-100 pb-2">
+                    <h2 class="text-lg font-bold text-emerald-900">Bahagian H: Kawalan Proses</h2>
+                    <button type="button" onclick="addProcessRow()" class="bg-purple-600 text-white p-2 rounded-full shadow-md">+</button>
+                </div>
+                <div id="processContainer" class="space-y-6"></div>
+            </div>
+
+            <!-- STEP 8: FAKTOR PENYUMBANG -->
+            <div id="step8" class="step-content animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2">Faktor Penyumbang (1-11)</h2>
+                <div id="dynamicRiskFactors" class="space-y-4"></div>
+            </div>
+
+            <!-- STEP 9: GAMBAR -->
+            <div id="step9" class="step-content animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2">Tab: Gambar Lapangan</h2>
+                <label class="block w-full border-2 border-dashed border-emerald-300 rounded-xl p-8 text-center cursor-pointer">
+                    <input type="file" accept="image/*" multiple capture="environment" class="hidden" id="generalImageInput" onchange="previewGeneralImages()">
+                    <span class="text-sm font-bold text-gray-600 uppercase">Klik Lampir Gambar</span>
+                </label>
+                <div id="generalImagePreview" class="grid grid-cols-2 gap-3 mt-4"></div>
+            </div>
+
+            <!-- STEP 10: KESIMPULAN -->
+            <div id="step10" class="step-content animate-fadeIn">
+                <h2 class="text-lg font-bold text-emerald-900 mb-4 border-b-2 border-emerald-100 pb-2">Rumusan & Jana Laporan</h2>
+                <textarea name="kesimpulan" id="kesimpulanArea" rows="12" class="form-input"></textarea>
+                <button type="button" onclick="generatePDF()" class="w-full bg-emerald-800 text-white font-bold py-4 rounded-xl mt-4 shadow-xl active:scale-95 transition-transform flex items-center justify-center gap-2">
+                    JANA LAPORAN PDF
+                </button>
+            </div>
+
+        </form>
+    </main>
+
+    <!-- Navigation -->
+    <nav class="fixed bottom-0 left-0 right-0 bg-white border-t p-4 flex justify-between items-center max-w-xl mx-auto z-40 shadow-2xl">
+        <button id="prevBtn" onclick="changeStep(-1)" class="text-gray-400 font-bold px-4 py-2 disabled:opacity-30">BALIK</button>
+        <div class="flex gap-1" id="dotsContainer"></div>
+        <button id="nextBtn" onclick="changeStep(1)" class="bg-emerald-800 text-white px-6 py-2 rounded-lg font-bold shadow-md">LANJUT</button>
+    </nav>
+
+    <script>
+        const bacteriaData = { "1-6": ["S. aureus", "B. cereus (Emetic)", "B. subtilis"], "7-12": ["C. perfringens", "B. cereus (Diarrheal)", "S. faecalis"], "13-72": ["Salmonella species", "Vibrio parahaemolyticus", "Escherichia coli", "Shigella", "Campylobacter jejuni"], ">4": ["Listeria monocytogenes", "Clostridium botulinum"] };
+        const riskTitles = ["Pengendali Makanan", "Pencemaran Silang", "Kemudahan Mencuci Tangan", "Kawalan Proses", "Program Pencucian", "Faktor Luar Kawalan", "Kawalan Makhluk Perosak", "Penyimpanan", "Penyelenggaraan Peralatan/Bangunan", "Kawalan Bahan Kimia", "Kenderaan Pengangkutan"];
+        
+        let currentStep = 1;
+        const totalSteps = 10;
+        window.generalImages = [];
+
+        function init() {
+            renderDots();
+            renderRiskFactors();
+            updateAgenOptions();
+            if(document.getElementById('handlersContainer').children.length === 0) addHandlerRow();
+            if(document.getElementById('rawMaterialsContainer').children.length === 0) addRawMaterialRow();
+            if(document.getElementById('processContainer').children.length === 0) addProcessRow();
+        }
+
+        window.init = init;
+
+        function renderDots() {
+            const dots = document.getElementById('dotsContainer');
+            dots.innerHTML = '';
+            for(let i=1; i<=totalSteps; i++) {
+                const d = document.createElement('div');
+                d.id = `dot-${i}`;
+                d.className = `h-1 rounded-full transition-all ${i===1 ? 'w-4 bg-emerald-600' : 'w-1 bg-gray-200'}`;
+                dots.appendChild(d);
+            }
+        }
+
+        function renderRiskFactors() {
+            const container = document.getElementById('dynamicRiskFactors');
+            container.innerHTML = '';
+            riskTitles.forEach((title, idx) => {
+                const div = document.createElement('div');
+                div.className = "risk-section";
+                div.innerHTML = `<div class="flex justify-between items-center mb-1"><h3 class="text-xs font-black uppercase text-emerald-800">${idx+1}. ${title}</h3><input type="checkbox" name="chk_risk_${idx+1}" class="w-4 h-4"></div><textarea name="ulasan_risk_${idx+1}" rows="2" class="form-input text-xs" placeholder="Penemuan..."></textarea>`;
+                container.appendChild(div);
+            });
+        }
+
+        function updateAgenOptions() {
+            const inkVal = document.getElementById('inkubasiSelect').value;
+            const select = document.getElementById('agenSelect');
+            if(!select) return;
+            select.innerHTML = '<option value="">-- Pilih Bakteria --</option>';
+            (bacteriaData[inkVal] || []).forEach(a => {
+                const opt = document.createElement('option');
+                opt.value = a; opt.innerText = a; select.appendChild(opt);
+            });
+        }
+
+        function changeStep(n) {
+            const newStep = currentStep + n;
+            if (newStep < 1 || newStep > totalSteps) return;
+            document.getElementById(`step${currentStep}`).classList.remove('active');
+            currentStep = newStep;
+            document.getElementById(`step${currentStep}`).classList.add('active');
+            document.getElementById('stepIndicator').innerText = `Langkah ${currentStep}/${totalSteps}`;
+            document.getElementById('prevBtn').disabled = currentStep === 1;
+            document.getElementById('nextBtn').innerText = currentStep === totalSteps ? 'SELESAI' : 'LANJUT';
+            for(let i=1; i<=totalSteps; i++) {
+                const d = document.getElementById(`dot-${i}`);
+                if(d) d.className = i <= currentStep ? (i === currentStep ? 'h-1 w-4 bg-emerald-600 rounded-full' : 'h-1 w-2 bg-emerald-400 rounded-full') : 'h-1 w-1 bg-gray-200 rounded-full';
+            }
+            if(currentStep === totalSteps) generateTemplateKesimpulan();
+            window.scrollTo(0, 0);
+        }
+
+        function addHandlerRow(nama='', jawatan='', typhoidDate='') {
+            const div = document.createElement('div');
+            div.className = "card-dynamic handler-row animate-fadeIn";
+            div.innerHTML = `
+                <button type="button" onclick="this.parentElement.remove()" class="absolute top-2 right-2 text-red-400 font-bold">&times;</button>
+                <input type="text" placeholder="Nama Pengendali" class="w-full font-bold text-sm border-b mb-2 outline-none" value="${nama}">
+                <div class="grid grid-cols-2 gap-2 text-[10px]">
+                    <div><label class="q-label">Jawatan</label><input type="text" class="form-input text-xs" value="${jawatan}"></div>
+                    <div><label class="q-label">Tarikh Typhoid</label><input type="date" class="form-input text-xs" value="${typhoidDate}"></div>
+                </div>`;
+            document.getElementById('handlersContainer').appendChild(div);
+        }
+
+        function addRawMaterialRow(name='', q1='Tidak', q2='Tidak', q3='Tidak', sumber='', simpanan='', keadaan='', tarikhBeli='') {
+            const div = document.createElement('div');
+            div.className = "card-dynamic raw-row animate-fadeIn";
+            div.innerHTML = `
+                <button type="button" onclick="this.parentElement.remove()" class="absolute top-2 right-2 text-red-400 font-bold">&times;</button>
+                <div class="flex justify-between items-start border-b mb-2 pb-1">
+                    <input type="text" placeholder="Nama Bahan Mentah" class="w-2/3 font-bold text-sm outline-none bg-transparent" value="${name}">
+                    <span class="badge-status status-tidak">TIDAK SENSITIF</span>
+                </div>
+                <div class="grid grid-cols-1 gap-2 mb-3">
+                    <div><label class="q-label">Sumber / Pembekal</label><input type="text" class="form-input text-xs" value="${sumber}"></div>
+                    <div class="grid grid-cols-2 gap-2">
+                        <div><label class="q-label">Tarikh Beli</label><input type="date" class="form-input text-xs" value="${tarikhBeli}"></div>
+                        <div><label class="q-label">Keadaan & Suhu</label><input type="text" class="form-input text-xs" value="${simpanan}"></div>
+                    </div>
+                </div>
+                <div class="space-y-1 bg-slate-50 p-2 rounded-lg border">
+                    <div class="q-row"><span class="q-text">Q1: Bahaya tahap tinggi?</span><select data-q="q1" class="border rounded" onchange="updateSensStatus(this.closest('.raw-row'))"><option value="Tidak" ${q1==='Tidak'?'selected':''}>Tidak</option><option value="Ya" ${q1==='Ya'?'selected':''}>Ya</option></select></div>
+                    <div class="q-row"><span class="q-text">Q2: Langkah seterusnya hapus bahaya?</span><select data-q="q2" class="border rounded" onchange="updateSensStatus(this.closest('.raw-row'))"><option value="Ya" ${q2==='Ya'?'selected':''}>Ya</option><option value="Tidak" ${q2==='Tidak'?'selected':''}>Tidak</option></select></div>
+                    <div class="q-row"><span class="q-text">Q3: Risiko silang dikesan?</span><select data-q="q3" class="border rounded" onchange="updateSensStatus(this.closest('.raw-row'))"><option value="Tidak" ${q3==='Tidak'?'selected':''}>Tidak</option><option value="Ya" ${q3==='Ya'?'selected':''}>Ya</option></select></div>
+                </div>`;
+            document.getElementById('rawMaterialsContainer').appendChild(div);
+            updateSensStatus(div);
+        }
+
+        function updateSensStatus(row) {
+            const q1 = row.querySelector('[data-q="q1"]').value;
+            const q2 = row.querySelector('[data-q="q2"]').value;
+            const q3 = row.querySelector('[data-q="q3"]').value;
+            let isS = (q1 === "Ya" && (q2 === "Tidak" || q3 === "Ya"));
+            const badge = row.querySelector('.badge-status');
+            badge.innerText = isS ? "SENSITIF" : "TIDAK SENSITIF";
+            badge.className = "badge-status " + (isS ? "status-ya" : "status-tidak");
+        }
+
+        function addProcessRow(step='', findings='', q1='Ya', q2='No', q3='No', q4='Ya', ulasan='') {
+            const div = document.createElement('div');
+            div.className = "process-row card-dynamic border-l-4 border-purple-500 animate-fadeIn";
+            div.innerHTML = `
+                <button type="button" onclick="this.parentElement.remove()" class="absolute top-2 right-2 text-red-400 font-bold">&times;</button>
+                <div class="flex justify-between items-center mb-2 pb-1 border-b">
+                    <input type="text" placeholder="Langkah Proses" class="w-1/2 font-bold text-sm outline-none" value="${step}">
+                    <span class="badge-status status-tidak text-[10px]">BUKAN CCP</span>
+                </div>
+                <textarea placeholder="Penemuan..." class="w-full text-xs p-2 bg-slate-50 rounded mb-2 outline-none" rows="2">${findings}</textarea>
+                <div class="space-y-1 mt-2">
+                    <div class="q-row"><span class="q-text">Q1: Kawalan wujud?</span><select data-pq="q1" class="border rounded" onchange="updateCCP(this.closest('.process-row'))"><option value="Ya" ${q1==='Ya'?'selected':''}>Ya</option><option value="No" ${q1==='No'?'selected':''}>No</option></select></div>
+                    <div class="q-row"><span class="q-text">Q2: Direka hapus bahaya?</span><select data-pq="q2" class="border rounded" onchange="updateCCP(this.closest('.process-row'))"><option value="No" ${q2==='No'?'selected':''}>No</option><option value="Ya" ${q2==='Ya'?'selected':''}>Ya</option></select></div>
+                    <div class="q-row"><span class="q-text">Q3: Pencemaran meningkat?</span><select data-pq="q3" class="border rounded" onchange="updateCCP(this.closest('.process-row'))"><option value="No" ${q3==='No'?'selected':''}>No</option><option value="Ya" ${q3==='Ya'?'selected':''}>Ya</option></select></div>
+                    <div class="q-row"><span class="q-text">Q4: Langkah seterusnya hapus?</span><select data-pq="q4" class="border rounded" onchange="updateCCP(this.closest('.process-row'))"><option value="Ya" ${q4==='Ya'?'selected':''}>Ya</option><option value="No" ${q4==='No'?'selected':''}>No</option></select></div>
+                </div>`;
+            document.getElementById('processContainer').appendChild(div);
+            updateCCP(div);
+        }
+
+        function updateCCP(row) {
+            const q1 = row.querySelector('[data-pq="q1"]').value;
+            const q2 = row.querySelector('[data-pq="q2"]').value;
+            const q3 = row.querySelector('[data-pq="q3"]').value;
+            const q4 = row.querySelector('[data-pq="q4"]').value;
+            let isC = (q1 === "Ya" && (q2 === "Ya" || (q3 === "Ya" && q4 === "No")));
+            const badge = row.querySelector('.badge-status');
+            badge.innerText = isC ? "CCP: YA" : "BUKAN CCP";
+            badge.className = "badge-status " + (isC ? "status-ya" : "status-tidak");
+        }
+
+        window.getFullData = () => {
+            const form = document.getElementById('haccpForm');
+            const basic = {};
+            new FormData(form).forEach((v, k) => basic[k] = v);
+            const handlers = [];
+            document.querySelectorAll('.handler-row').forEach(row => {
+                const i = row.querySelectorAll('input, select');
+                handlers.push({ nama: i[0].value, jawatan: i[1].value, typhoidDate: i[2].value });
+            });
+            const rawMaterials = [];
+            document.querySelectorAll('.raw-row').forEach(row => {
+                const n = row.querySelector('input').value;
+                const s = row.querySelectorAll('select');
+                const inp = row.querySelectorAll('input');
+                rawMaterials.push({ name: n, q1: s[0].value, q2: s[1].value, q3: s[2].value, sumber: inp[1].value, tarikhBeli: inp[2].value, simpanan: inp[3].value });
+            });
+            const processes = [];
+            document.querySelectorAll('.process-row').forEach(row => {
+                const s = row.querySelector('input').value;
+                const f = row.querySelector('textarea').value;
+                const sel = row.querySelectorAll('select');
+                processes.push({ step: s, findings: f, q1: sel[0].value, q2: sel[1].value, q3: sel[2].value, q4: sel[3].value });
+            });
+            return { basic, handlers, rawMaterials, processes, images: window.generalImages, updatedAt: new Date().toISOString() };
+        };
+
+        function generateTemplateKesimpulan() {
+            const data = getFullData();
+            const d = data.basic;
+            document.getElementById('kesimpulanArea').value = `Hasil siasatan di ${d.namaPremis || '[PREMIS]'} mendapati kejadian KRM berpunca daripada ketidakpatuhan proses kritikal bagi menu ${d.makananDisyaki || '[MENU]'}. Agen yang dikesan adalah ${d.agen || '[AGEN]'}. Tahap kebersihan premis sebelum kejadian dicatatkan sebagai ${d.kebersihanSebelum || 'tiada rekod'} manakala semasa siasatan adalah ${d.kebersihanSemasa || 'tiada rekod'}.`;
+        }
+
+        function previewGeneralImages() {
+            const input = document.getElementById('generalImageInput');
+            for (const file of input.files) {
+                const r = new FileReader();
+                r.onload = (e) => { window.generalImages.push({ url: e.target.result }); renderImagePreview(); };
+                r.readAsDataURL(file);
+            }
+        }
+
+        function renderImagePreview() {
+            const p = document.getElementById('generalImagePreview');
+            p.innerHTML = '';
+            window.generalImages.forEach((img, i) => {
+                const div = document.createElement('div');
+                div.className = "card-dynamic p-1 relative";
+                div.innerHTML = `<img src="${img.url}" class="w-full aspect-square object-cover rounded-lg"><button type="button" onclick="window.generalImages.splice(${i},1);renderImagePreview();" class="absolute top-1 right-1 bg-red-600 text-white rounded-full w-5 h-5 flex items-center justify-center font-bold shadow-md">&times;</button>`;
+                p.appendChild(div);
+            });
+        }
+
+        function showToast(msg, type) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.style.backgroundColor = type === 'success' ? '#059669' : '#dc2626';
+            t.style.display = 'block';
+            setTimeout(() => t.style.display = 'none', 3000);
+        }
+
+        function openLoadModal() { document.getElementById('loadModal').style.display = 'flex'; if(window.loadDrafts) window.loadDrafts(); }
+        function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+        function confirmReset() { if(confirm("Mula semula?")) location.reload(); }
+
+        async function generatePDF() {
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+            const data = getFullData();
+            const d = data.basic;
+            doc.setFontSize(14); doc.setFont("helvetica", "bold");
+            doc.text("LAPORAN SIASATAN KERACUNAN MAKANAN (HACCPKRM)", 105, 18, { align: "center" });
+            doc.line(15, 22, 195, 22);
+            doc.autoTable({ startY: 28, body: [["Premis", d.namaPremis || '-'], ["Negeri/Daerah", `${d.negeri} / ${d.daerah}`], ["Siasatan", d.tarikhSiasatan || '-'], ["Kebersihan Sblm", d.kebersihanSebelum || '-'], ["Kebersihan Semasa", d.kebersihanSemasa || '-']], styles: { fontSize: 9 } });
+            doc.save(`HACCPKRM_${d.namaPremis || 'Laporan'}.pdf`);
+        }
+
+        window.onload = init;
+        window.addHandlerRow = addHandlerRow;
+        window.addRawMaterialRow = addRawMaterialRow;
+        window.addProcessRow = addProcessRow;
+        window.previewGeneralImages = previewGeneralImages;
+        window.updateAgenOptions = updateAgenOptions;
+        window.changeStep = changeStep;
+        window.updateSensStatus = updateSensStatus;
+        window.updateCCP = updateCCP;
+        window.openLoadModal = openLoadModal;
+        window.closeModal = closeModal;
+        window.confirmReset = confirmReset;
+        window.generatePDF = generatePDF;
+    </script>
+</body>
+</html>
